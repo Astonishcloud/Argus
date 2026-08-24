@@ -1,0 +1,187 @@
+name: Auto Sync Upstream and Release
+
+# 每天自动检查上游 MMArgus-Team/Argus 有没有新提交：
+#   有新提交 → 合并进 main → 在 windows-latest 上打 NSIS 安装包 → 自动发 Release
+#   没有新提交 → 直接结束，不构建（省 runner 时间）
+#
+# 手动运行时有两个开关：
+#   force_build = true  上游没更新也强制构建一次
+#   dry_run     = true  Release 发成草稿（不出现在公开 Releases 列表，验证用）
+#
+# 行为约定：
+#   - main 始终跟上上游。合并成功就推送，即使随后构建失败——那种情况只是没有新
+#     Release，代码同步本身是对的，失败会发邮件给你。
+#   - 与上游冲突时（你自己改了上游同样改过的文件）任务直接失败并提示手动解决，
+#     绝不自动丢弃任何一边的改动。
+#   - tag 形如 win-20260825-63ef50a，不以 v 开头，因此不会触发 build-in.yml
+#     重复构建，也不会和上游的 v0.1.x tag 撞名。
+
+on:
+  schedule:
+    # UTC 21:17 = 北京时间次日 05:17。避开整点，GitHub 整点排队最严重。
+    - cron: '17 21 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '上游没有更新也强制构建'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Release 发成草稿（不公开）'
+        type: boolean
+        default: false
+
+# 推 main 和发 Release 都需要写权限
+permissions:
+  contents: write
+
+# 定时任务和手动运行不要叠在一起跑
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/MMArgus-Team/Argus.git
+
+jobs:
+  sync:
+    name: 同步上游
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.sync.outputs.has_update }}
+      before_sha: ${{ steps.sync.outputs.before_sha }}
+      after_sha: ${{ steps.sync.outputs.after_sha }}
+      behind: ${{ steps.sync.outputs.behind }}
+      version: ${{ steps.sync.outputs.version }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 合并需要完整历史
+
+      - name: Merge upstream/main
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "$UPSTREAM_URL"
+          # 只取上游的 main，不取它的 tag——避免和你自己的 v0.1.0 撞名
+          git fetch --no-tags --quiet upstream main
+
+          before="$(git rev-parse HEAD)"
+          behind="$(git rev-list --count HEAD..upstream/main)"
+          echo "上游有 $behind 个提交还没进 main"
+
+          if [ "$behind" -gt 0 ]; then
+            if ! git merge --no-edit upstream/main; then
+              echo "::error::与上游合并冲突，已中止。请本地执行 git fetch upstream && git merge upstream/main 手动解决。"
+              exit 1
+            fi
+            git push origin HEAD:main
+            echo "已合并并推送到 main"
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "无需同步"
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          after="$(git rev-parse HEAD)"
+          base="$(jq -r .version apps/desktop/package.json)"
+          day="$(TZ=Asia/Shanghai date +%Y%m%d)"
+
+          {
+            echo "before_sha=$before"
+            echo "after_sha=$after"
+            echo "behind=$behind"
+            echo "version=${base}-${day}"
+            echo "tag=win-${day}-${after:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### 上游同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游领先提交数 | ${{ steps.sync.outputs.behind }} |"
+            echo "| 是否合并 | ${{ steps.sync.outputs.has_update }} |"
+            echo "| main 现在指向 | \`${{ steps.sync.outputs.after_sha }}\` |"
+            echo "| 本次版本号 | \`${{ steps.sync.outputs.version }}\` |"
+            echo "| 本次 tag | \`${{ steps.sync.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 打包并发 Release
+    needs: sync
+    # 上游有更新才构建；手动运行可以用 force_build 强制
+    if: needs.sync.outputs.has_update == 'true' || inputs.force_build == true
+    runs-on: windows-latest
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.after_sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python (node-gyp 编译 node-pty 需要)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 必须从仓库根安装（assert-root-install.cjs 会校验），且不能加 --workspace
+      - name: Install workspace deps (compiles node-pty)
+        run: npm ci
+
+      # 安装包文件名取自 apps/desktop/package.json 的 version。加上日期后缀，
+      # 每天的产物名字才能区分开（如 Argus-0.1.0-20260825-win-x64.exe）。
+      # 必须在 npm ci 之后改：提前改会让 npm ci 的 lockfile 校验失败。
+      # 版本号不会传给 rcedit（见 scripts/set-exe-identity.cjs），所以后缀不影响 exe 图标。
+      - name: Stamp build version
+        shell: bash
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: node -e "const f='apps/desktop/package.json',fs=require('fs'),j=JSON.parse(fs.readFileSync(f,'utf8'));j.version=process.env.VERSION;fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n');console.log('desktop version ->',j.version)"
+
+      - name: Build Windows NSIS installer
+        run: cd apps\desktop; npm run dist:win:nsis
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argus-windows-installer-${{ needs.sync.outputs.tag }}
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          target_commitish: ${{ needs.sync.outputs.after_sha }}
+          name: Argus Windows ${{ needs.sync.outputs.version }}
+          draft: ${{ inputs.dry_run == true }}
+          files: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
+          body: |
+            自动构建，源码已同步至上游 [MMArgus-Team/Argus](https://github.com/MMArgus-Team/Argus)。
+
+            - 桌面版本号：`${{ needs.sync.outputs.version }}`
+            - 源码提交：[`${{ needs.sync.outputs.after_sha }}`](https://github.com/${{ github.repository }}/commit/${{ needs.sync.outputs.after_sha }})
+            - 本次并入上游提交数：${{ needs.sync.outputs.behind }}
+            - [查看本次并入的改动](https://github.com/${{ github.repository }}/compare/${{ needs.sync.outputs.before_sha }}...${{ needs.sync.outputs.after_sha }})
+
+            **安装**：下载 `.exe` 双击即可，按当前用户安装、无需管理员权限、可自选目录。
+            安装包未做代码签名，Windows SmartScreen 首次会提示，选「更多信息 → 仍要运行」。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
