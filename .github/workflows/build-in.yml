@@ -1,4 +1,3 @@
-
 name: Build Argus Windows Installer
 
 # 在 macOS / Linux 上无法交叉编译出可用的 Windows 安装包
@@ -7,18 +6,13 @@ name: Build Argus Windows Installer
 #
 # 触发方式：
 #   1) 手动：仓库 → Actions → 本工作流 → Run workflow（只产出 Artifacts，供临时下载）
-#   2) 打 tag：push 以 v 开头的 tag（如 v0.1.0）自动触发，并自动创建 GitHub Release
+#   2) 打 tag：push 以 v 开头的 tag（如 v0.2.0）自动触发，并自动创建 / 更新 GitHub Release
 #
 # 产物去哪：
-#   - 手动运行 → Actions 运行页底部 Artifacts 下载 `argus-windows-installer`（保留 90 天）
-#   - tag 运行   → 仓库 Releases 页自动出现带 .exe 的 Release（永久保留）
-#
-# 说明：
-#   - npm ci 会编译 node-pty 的 Windows 二进制（windows-latest 自带 VS Build Tools + Python）。
-#   - ELECTRON_MIRROR / ELECTRON_BUILDER_BINARIES_MIRROR 走 npmmirror，避免卡在 GitHub Releases。
-#   - 这里只打 NSIS(.exe)；若要同时出 MSI，把构建步改成 `npm run dist:win`。
+#   - 手动运行 → Actions 运行页底部 Artifacts 下载 `argus-windows-installer`（zip，保留 90 天）
+#   - tag 运行 → 仓库 Releases 页出现带 .exe 的 Release（永久保留）
 
-# 发 Release 需要写权限（GITHUB_TOKEN 默认没有，必须显式授权）
+# 发 Release 需要写权限（GITHUB_TOKEN 默认只读，必须显式授权）
 permissions:
   contents: write
 
@@ -27,6 +21,11 @@ on:
   push:
     tags:
       - 'v*'
+
+# 同一个 ref 上连续推送时，取消上一次还在跑的构建，省 runner 时间
+concurrency:
+  group: build-win-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-win:
@@ -46,19 +45,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 国内加速：Electron / NSIS / node-pty 等二进制走 npmmirror
-      - name: Set domestic mirrors
-        run: |
-          npm config set registry https://registry.npmmirror.com
-          echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" >> $env:GITHUB_ENV
-          echo "ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/" >> $env:GITHUB_ENV
+      # GitHub 的 Runner 在海外，走 npmmirror 反而绕远，默认不开。
+      # 只有当 Electron / NSIS 二进制下载卡住时才取消注释：
+      # - name: Set mirrors
+      #   run: |
+      #     npm config set registry https://registry.npmmirror.com
+      #     echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" >> $env:GITHUB_ENV
+      #     echo "ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/" >> $env:GITHUB_ENV
 
-      # 若 node-pty 编译报 “msbuild not found”，可取消下面这步注释（提供 VS 开发环境）：
-      # - name: Setup MSVC
-      #   uses: ilammy/msvc-dev-cmd@v1
-
+      # 必须从仓库根安装（assert-root-install.cjs 会校验），且不能加 --workspace
       - name: Install workspace deps (compiles node-pty)
         run: npm ci
+
+      # 安装包文件名里的版本号取自 apps/desktop/package.json，而不是 tag。
+      # 不同步的话，打 v0.2.0 仍然会产出 Argus-0.1.0-win-x64.exe。
+      # 这步必须放在 npm ci 之后：提前改 package.json 会让 npm ci 的 lockfile 校验失败。
+      - name: Sync desktop version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: node -e "const f='apps/desktop/package.json',fs=require('fs'),j=JSON.parse(fs.readFileSync(f,'utf8'));j.version=process.env.GITHUB_REF_NAME.replace(/^v/,'');fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n');console.log('desktop version ->',j.version)"
 
       - name: Build Windows NSIS installer
         run: cd apps\desktop; npm run dist:win:nsis
@@ -68,7 +73,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: argus-windows-installer
-          path: apps/desktop/release/*
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
           if-no-files-found: error
 
       # 自动发 Release：仅在推送 v* tag 时执行（手动运行只产出 Artifacts）
@@ -76,12 +83,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          # release 以 tag 命名；手动运行时用 run 编号兜底
           tag_name: ${{ github.ref_name }}
           name: Argus ${{ github.ref_name }}
-          files: apps/desktop/release/*
+          # 只挂安装器和它的 blockmap（增量更新用），不再把 builder-debug.yml 传上去
+          files: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.exe.blockmap
           generate_release_notes: true
-          # draft: false            # 设为 true 可先存草稿再手动发布
-          # prerelease: false        # 设为 true 标记为预发布
+          # draft: true       # 想先存草稿再手动发布就打开
+          # prerelease: true  # 想标记为预发布就打开
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
