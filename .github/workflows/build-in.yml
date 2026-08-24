@@ -1,17 +1,26 @@
+
 name: Build Argus Windows Installer
 
 # 在 macOS / Linux 上无法交叉编译出可用的 Windows 安装包
 # （桌面端依赖原生模块 node-pty，需要 Windows 平台的 .node 二进制）。
-# 因此用 GitHub 的 windows-latest Runner 自动出包，跑完在 Artifacts 里下载 .exe。
+# 因此用 GitHub 的 windows-latest Runner 自动出包。
 #
 # 触发方式：
-#   1) 手动：仓库 → Actions → 本工作流 → Run workflow
-#   2) 打 tag：push 以 v 开头的 tag（如 v0.1.0）自动触发
+#   1) 手动：仓库 → Actions → 本工作流 → Run workflow（只产出 Artifacts，供临时下载）
+#   2) 打 tag：push 以 v 开头的 tag（如 v0.1.0）自动触发，并自动创建 GitHub Release
+#
+# 产物去哪：
+#   - 手动运行 → Actions 运行页底部 Artifacts 下载 `argus-windows-installer`（保留 90 天）
+#   - tag 运行   → 仓库 Releases 页自动出现带 .exe 的 Release（永久保留）
 #
 # 说明：
 #   - npm ci 会编译 node-pty 的 Windows 二进制（windows-latest 自带 VS Build Tools + Python）。
 #   - ELECTRON_MIRROR / ELECTRON_BUILDER_BINARIES_MIRROR 走 npmmirror，避免卡在 GitHub Releases。
-#   - 这里只打 NSIS(.exe)；若要同时出 MSI，把最后一步改成 `npm run dist:win`。
+#   - 这里只打 NSIS(.exe)；若要同时出 MSI，把构建步改成 `npm run dist:win`。
+
+# 发 Release 需要写权限（GITHUB_TOKEN 默认没有，必须显式授权）
+permissions:
+  contents: write
 
 on:
   workflow_dispatch: {}
@@ -54,9 +63,25 @@ jobs:
       - name: Build Windows NSIS installer
         run: cd apps\desktop; npm run dist:win:nsis
 
+      # 始终上传 Artifacts（手动运行也能拿到，保留 90 天）
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: argus-windows-installer
           path: apps/desktop/release/*
           if-no-files-found: error
+
+      # 自动发 Release：仅在推送 v* tag 时执行（手动运行只产出 Artifacts）
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # release 以 tag 命名；手动运行时用 run 编号兜底
+          tag_name: ${{ github.ref_name }}
+          name: Argus ${{ github.ref_name }}
+          files: apps/desktop/release/*
+          generate_release_notes: true
+          # draft: false            # 设为 true 可先存草稿再手动发布
+          # prerelease: false        # 设为 true 标记为预发布
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
