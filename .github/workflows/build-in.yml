@@ -1,0 +1,62 @@
+name: Build Argus Windows Installer
+
+# 在 macOS / Linux 上无法交叉编译出可用的 Windows 安装包
+# （桌面端依赖原生模块 node-pty，需要 Windows 平台的 .node 二进制）。
+# 因此用 GitHub 的 windows-latest Runner 自动出包，跑完在 Artifacts 里下载 .exe。
+#
+# 触发方式：
+#   1) 手动：仓库 → Actions → 本工作流 → Run workflow
+#   2) 打 tag：push 以 v 开头的 tag（如 v0.1.0）自动触发
+#
+# 说明：
+#   - npm ci 会编译 node-pty 的 Windows 二进制（windows-latest 自带 VS Build Tools + Python）。
+#   - ELECTRON_MIRROR / ELECTRON_BUILDER_BINARIES_MIRROR 走 npmmirror，避免卡在 GitHub Releases。
+#   - 这里只打 NSIS(.exe)；若要同时出 MSI，把最后一步改成 `npm run dist:win`。
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python (node-gyp 编译 node-pty 需要)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 国内加速：Electron / NSIS / node-pty 等二进制走 npmmirror
+      - name: Set domestic mirrors
+        run: |
+          npm config set registry https://registry.npmmirror.com
+          echo "ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/" >> $env:GITHUB_ENV
+          echo "ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/" >> $env:GITHUB_ENV
+
+      # 若 node-pty 编译报 “msbuild not found”，可取消下面这步注释（提供 VS 开发环境）：
+      # - name: Setup MSVC
+      #   uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install workspace deps (compiles node-pty)
+        run: npm ci
+
+      - name: Build Windows NSIS installer
+        run: cd apps\desktop; npm run dist:win:nsis
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argus-windows-installer
+          path: apps/desktop/release/*
+          if-no-files-found: error
